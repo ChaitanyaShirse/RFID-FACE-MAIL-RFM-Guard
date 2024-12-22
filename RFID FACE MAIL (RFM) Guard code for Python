@@ -1,0 +1,244 @@
+# Verification for Cardholder
+import cv2
+from deepface import DeepFace
+import time
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email import encoders
+import imaplib
+import email
+from email.header import decode_header
+import os
+import serial
+import threading
+from datetime import datetime
+
+# Arduino connection
+arduino = serial.Serial(port="COM8", baudrate=9600, timeout=1)  # Update COM port as per your system
+
+# Email credentials
+sender_email = "Replace youar Mail id"
+sender_password = "Replace 16 digit password"
+
+# IMAP server
+IMAP_SERVER = "imap.gmail.com"
+
+# User data
+users = {
+    "7335AFE4": {
+        "name": "Chaitanya Shirse",
+        "image_path": "D:\\Camera Roll\\WIN_20230725_22_37_40_Pro.jpg",
+        "email": "chaitanya3035@gmail.com",
+        "passcode": "1111"
+    },
+    # Add other users here...
+}
+
+selected_user = None
+
+
+# Function to send email with an attachment
+def send_email_with_attachment(sender_email, sender_password, recipient_email, subject, message_body, attachment_path):
+    try:
+        msg = MIMEMultipart()
+        msg['Subject'] = subject
+        msg['From'] = sender_email
+        msg['To'] = recipient_email
+
+        # HTML content with Accept and Deny buttons
+        html = f"""
+        <html>
+            <body>
+                <p>Dear User,</p>
+                <p>An unknown person tried using your card. Please respond:</p>
+                <a href="https://www.example.com/accept" style="padding: 10px; background-color: green; color: white; text-decoration: none; border-radius: 5px;">Accept</a>
+                <a href="https://www.example.com/deny" style="padding: 10px; background-color: red; color: white; text-decoration: none; border-radius: 5px;">Deny</a>
+                <p>Thank you!</p>
+            </body>
+        </html>
+        """
+        msg.attach(MIMEText(html, 'html'))
+
+        if os.path.exists(attachment_path):
+            with open(attachment_path, 'rb') as attachment:
+                part = MIMEBase('application', 'octet-stream')
+                part.set_payload(attachment.read())
+            encoders.encode_base64(part)
+            part.add_header(
+                'Content-Disposition',
+                f'attachment; filename={os.path.basename(attachment_path)}',
+            )
+            msg.attach(part)
+
+        with smtplib.SMTP('smtp.gmail.com', 587) as server:
+            server.starttls()
+            server.login(sender_email, sender_password)
+            server.sendmail(sender_email, recipient_email, msg.as_string())
+        print(f"Email sent successfully to {recipient_email}!")
+    except Exception as e:
+        print(f"Error while sending email: {e}")
+
+
+# Function to read RFID UID from Arduino
+def read_rfid():
+    if arduino.in_waiting > 0:
+        uid = arduino.readline().decode("utf-8").strip()
+        return uid
+    return None
+
+
+# Function to show the welcome screen
+def show_welcome_screen():
+    print('Please insert a card')
+    while True:
+        uid = read_rfid()
+        if uid:
+            print(f"Scanned UID: {uid}")
+            if uid in users:
+                global selected_user
+                selected_user = uid
+                print(f"Selected user: {users[uid]['name']}")
+                start_verification(uid)
+                return
+            else:
+                print("Unknown card. Please try again.")
+
+
+# Function to start verification for a selected user
+def start_verification(user_key):
+    person = users[user_key]
+    verification_thread = threading.Thread(target=verify_face, args=(person,))
+    verification_thread.start()
+
+
+# Function to verify the face
+def verify_face(person):
+    print(f"Verifying for {person['name']}...")
+    video_capture = cv2.VideoCapture(0)
+    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+
+    verified = False
+    unknown_face_detected = False
+
+    while True:
+        ret, frame = video_capture.read()
+        if not ret:
+            break
+
+        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = face_cascade.detectMultiScale(gray_frame, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
+
+        for (x, y, w, h) in faces:
+            face_crop = frame[y:y + h, x:x + w]
+            temp_face_path = "temp_face.jpg"
+            cv2.imwrite(temp_face_path, face_crop)
+
+            try:
+                result = DeepFace.verify(
+                    img1_path=person["image_path"],
+                    img2_path=temp_face_path,
+                    model_name="VGG-Face",
+                    enforce_detection=False
+                )
+                if result["verified"]:
+                    verified = True
+                    break
+            except Exception as e:
+                print(f"Verification error: {e}")
+
+        if verified:
+            print(f"✅ Successfully verified {person['name']}'s face")
+            print("Wait for finale Week 5, 28 Dec 2024")
+            time.sleep(10)
+            show_welcome_screen()
+            break
+
+        if not unknown_face_detected:
+            print("❌ Unknown face detected...")
+            unknown_face_detected = True
+            timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            unknown_image_path = f"unknown_{timestamp}.jpg"
+            cv2.imwrite(unknown_image_path, frame)
+            send_email_with_attachment(
+                sender_email, sender_password, person["email"],
+                "Action Required: Unknown Attempt Detected",
+                "An unknown person tried using your card. See the attached image.",
+                unknown_image_path
+            )
+            monitor_all_emails(person)
+            break
+
+    video_capture.release()
+    cv2.destroyAllWindows()
+
+
+def monitor_all_emails(person):
+    """Monitor all new emails and check for 'accept' keyword."""
+    print("Wait for Email Response...")
+
+    try:
+        mail = imaplib.IMAP4_SSL(IMAP_SERVER)
+        mail.login(sender_email, sender_password)
+        start_time = datetime.now()
+
+        while True:
+            mail.select("inbox")
+            status, messages = mail.search(None, "UNSEEN")
+            email_ids = messages[0].split()
+
+            for email_id in email_ids:
+                status, msg_data = mail.fetch(email_id, "(RFC822)")
+
+                for response_part in msg_data:
+                    if isinstance(response_part, tuple):
+                        msg = email.message_from_bytes(response_part[1])
+
+                        # Safely handle missing headers
+                        date_str = msg.get("Date", "")
+                        try:
+                            email_time = datetime.strptime(date_str, "%a, %d %b %Y %H:%M:%S %z").replace(tzinfo=None)
+                            if email_time < start_time:
+                                continue
+                        except Exception as e:
+                            print(f"Error parsing email date: {e}")
+                            continue
+
+                        from_ = msg.get("From", "Unknown Sender")
+                        subject, encoding = decode_header(msg.get("Subject", "No Subject"))[0]
+                        if isinstance(subject, bytes):
+                            subject = subject.decode(encoding if encoding else "utf-8")
+
+                        body = ""
+                        if msg.is_multipart():
+                            for part in msg.walk():
+                                if part.get_content_type() == "text/plain":
+                                    body = part.get_payload(decode=True).decode(errors="ignore")
+                                    break
+                        else:
+                            body = msg.get_payload(decode=True).decode(errors="ignore")
+
+                        #print(f"From: {from_}, Subject: {subject}, Body: {body}")
+
+                        if 'accept' in subject.lower() or 'accept' in body.lower() or 'yes' in subject.lower() or 'yes' in body.lower():
+                            print("Access Granted")
+                            print("Wait for finale Week 5, 28 Dec 2024")
+                            time.sleep(10)
+                            show_welcome_screen()
+                            return
+
+                        elif 'deny' in subject.lower() or 'deny' in body.lower() or 'no' in subject.lower() or 'no' in body.lower():
+                            print("Access Denied")
+                            show_welcome_screen()
+                            return
+                break
+
+            time.sleep(10)  # Wait for 10 seconds before checking again
+    except Exception as e:
+        print(f"Error while checking emails: {e}")
+        show_welcome_screen()
+
+
+# Start the program
+show_welcome_screen()
